@@ -1,0 +1,120 @@
+# ============================================================
+# LKAi Office 云服务器部署配置
+# 使用方式: docker compose pull && docker compose up -d
+# 所有环境变量已内联，服务器上无需额外 .env 文件
+#
+# 数据库说明：
+#   - 默认使用外部 MySQL（DATABASE_URL 指向远程 MySQL）
+#   - 如需内置 MySQL，取消下方 mysql 服务的注释
+#   - 如需 SQLite，注释掉 DATABASE_URL 即可
+# ============================================================
+
+version: "3.8"
+
+services:
+  lkai-office:
+    image: registry.cn-hangzhou.aliyuncs.com/xfg-studio/lkai-office:1.1.1
+    container_name: lkai-office
+    ports:
+      - "8000:8000"
+    environment:
+      # ── 基础配置 ──
+      AIPPT_APP_NAME: "LKAi Office"
+      AIPPT_HOST: 0.0.0.0
+      AIPPT_PORT: 8000
+
+      # ── 安全配置（部署时必改 JWT_SECRET）──
+      AIPPT_JWT_SECRET: CHANGE_ME_TO_RANDOM_SECRET
+      AIPPT_JWT_EXPIRY_HOURS: 24
+
+      # ── 登录配置（也可以让AI去掉登录） ──
+      LKAI_OFFICE_X_API_AUTH_LOGIN_URL: https://x-api.itedus.cn/api/v1/auth/login
+
+      # ── 数据库配置 ──
+      # 方式一：外部 MySQL（当前配置）
+      #   确保远程 MySQL 已建库 lkai-office，且字符集为 utf8mb4
+      #   charset=utf8mb4 必须带，否则中文乱码
+      DATABASE_URL: mysql://root:123456@127.0.0.1:3306/lkai-office?charset=utf8mb4
+      DB_MAX_CONNECTIONS: "8"
+
+      # 方式二：内置 MySQL（取消下方 mysql 服务注释，并改 DATABASE_URL）
+      #   DATABASE_URL: mysql://root:%21%40%23123QWEqwe@mysql:3306/lkai-office?charset=utf8mb4
+
+      # 方式三：SQLite（注释掉 DATABASE_URL 即可，数据存在 /app/data/lkai-office.db）
+      #   DATABASE_URL: sqlite:data/lkai-office.db
+
+      # ── 文本 LLM（部署时必改 API_KEY）──
+      LLM_TEXT_BASE_URL: https://apihub.agnes-ai.cn/v1
+      LLM_TEXT_API_KEY: 申请你的key https://platform.agnes-ai.cn/
+      LLM_TEXT_MODELS: agnes-2.5-flash
+
+      # ── 图片模型（部署时必改 API_KEY）──
+      LLM_IMAGE_BASE_URL: https://apihub.agnes-ai.cn/v1
+      LLM_IMAGE_API_KEY: 申请你的key https://platform.agnes-ai.cn/
+      LLM_IMAGE_MODELS: agnes-image-2.1-flash
+
+      # ── 视频模型（部署时必改 API_KEY）──
+      LLM_VIDEO_BASE_URL: https://apihub.agnes-ai.cn/v1
+      LLM_VIDEO_API_KEY: 申请你的key https://platform.agnes-ai.cn/
+      LLM_VIDEO_MODELS: agnes-video-v2.0
+
+      # ── Agent 配置 ──
+      AIPPT_LLM_PROVIDER: glm-gateway
+      AIPPT_LLM_TOOL_TIMEOUT_MS: 1800000
+      AIPPT_LLM_CHAT_TIMEOUT_MS: 1800000
+
+      # ── 联网搜索 ──
+      AIPPT_WEB_SEARCH_PROVIDER: auto
+      AIPPT_WEB_SEARCH_ENDPOINT: http://127.0.0.1:8080
+      AIPPT_WEB_SEARCH_TIMEOUT_MS: 20000
+      AIPPT_BAIDU_MCP_API_KEY: "申请你的key https://console.bce.baidu.com/iam/?_=1753597622044#/iam/apikey/list"
+      AIPPT_BAIDU_MCP_SSE_ENDPOINT: http://appbuilder.baidu.com/v2/ai_search/mcp/sse
+
+      # ── 数据目录（容器内路径，不要改）──
+      AIPPT_DATA_DIR: data
+      AIPPT_PROJECTS_DIR: data/projects
+      AIPPT_SESSIONS_DIR: data/sessions
+      AIPPT_RENDER_OUTPUT_DIR: outputs
+
+      # ── CORS（改成你的域名或服务器 IP）──
+      AIPPT_CORS_ORIGINS: https://lkai-office.xiaofuge.cn,http://180.76.188.127:5173,http://180.76.188.127:8000
+
+    security_opt:
+      - seccomp:unconfined
+    volumes:
+      - ./data:/app/data
+      - ./outputs:/app/outputs
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ── 内置 MySQL（可选，取消注释即可使用）──
+  # mysql:
+  #   image: mysql:8.0
+  #   container_name: lkai-office-mysql
+  #   environment:
+  #     MYSQL_ROOT_PASSWORD: lkai-office123
+  #     MYSQL_DATABASE: lkai-office
+  #   command: --character-set-server=utf8mb4 --collation-server=utf8mb4_0900_ai_ci
+  #   ports:
+  #     - "3306:3306"
+  #   volumes:
+  #     - mysql-data:/var/lib/mysql
+  #   restart: unless-stopped
+  #   healthcheck:
+  #     test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uroot", "-plkai-office123"]
+  #     interval: 10s
+  #     timeout: 5s
+  #     retries: 5
+
+volumes:
+  mysql-data:
