@@ -29,22 +29,22 @@ fn infer_markdown_scene(topic: &str) -> &'static str {
         "用户故事",
         "feature",
     ]
-    .iter()
-    .any(|keyword| lower.contains(keyword))
+        .iter()
+        .any(|keyword| lower.contains(keyword))
     {
         "当前更像产品知识沉淀场景，请重点补足背景、用户场景、功能说明、流程、边界和 FAQ。"
     } else if [
         "运营", "增长", "拉新", "留存", "转化", "活动", "campaign", "gmv",
     ]
-    .iter()
-    .any(|keyword| lower.contains(keyword))
+        .iter()
+        .any(|keyword| lower.contains(keyword))
     {
         "当前更像运营复盘/方法论沉淀场景，请重点补足指标口径、动作拆解、案例和经验总结。"
     } else if [
         "销售", "客户", "商机", "渠道", "业绩", "回款", "签约", "线索",
     ]
-    .iter()
-    .any(|keyword| lower.contains(keyword))
+        .iter()
+        .any(|keyword| lower.contains(keyword))
     {
         "当前更像销售资料整理场景，请重点补足客户画像、销售流程、关键话术、阶段策略和常见问题。"
     } else if [
@@ -59,15 +59,15 @@ fn infer_markdown_scene(topic: &str) -> &'static str {
         "agent",
         "ai",
     ]
-    .iter()
-    .any(|keyword| lower.contains(keyword))
+        .iter()
+        .any(|keyword| lower.contains(keyword))
     {
         "当前更像技术文档/README 场景，请重点补足架构说明、目录结构、安装步骤、配置示例、调用示例和排错说明。"
     } else if [
         "培训", "课程", "学习", "上手", "入门", "手册", "宣导", "workshop",
     ]
-    .iter()
-    .any(|keyword| lower.contains(keyword))
+        .iter()
+        .any(|keyword| lower.contains(keyword))
     {
         "当前更像培训讲义/操作手册场景，请重点补足学习路径、步骤、示例、练习建议和常见误区。"
     } else if ["项目", "排期", "里程碑", "实施", "交付", "风险", "计划"]
