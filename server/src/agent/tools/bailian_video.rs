@@ -38,7 +38,7 @@ pub async fn run_bailian_video(
     let mut input = json!({ "prompt": prompt });
     let ratio = match first_frame {
         Some(frame) if !frame.is_empty() => {
-            input["media"] = json!([{ "type": "first_frame", "image_url": frame }]);
+            input["media"] = json!([{ "type": "first_frame", "url": frame }]);
             "adaptive"
         }
         _ => aspect_ratio,
@@ -47,9 +47,11 @@ pub async fn run_bailian_video(
         "model": model,
         "input": input,
         "parameters": {
-            "resolution": "720P",
+            "resolution": "480P",
             "ratio": ratio,
-            "duration": duration_secs
+            "duration": duration_secs,
+            // 提示词已由规划环节写得很详细，关闭百炼提示词扩展，避免其扩展服务 500
+            "prompt_extend": false
         }
     });
 
@@ -73,6 +75,7 @@ pub async fn run_bailian_video(
         .header("X-DashScope-Async", "enable")
         .header("Authorization", format!("Bearer {api_key}"))
         .header("Content-Type", "application/json")
+        .json(&body)
         .send()
         .await?;
     let status = resp.status();
@@ -89,7 +92,8 @@ pub async fn run_bailian_video(
         .to_string();
 
     // 轮询任务结果；连续 3 次查询失败 / 超过 180 秒则判定百炼不可用，交给上层降级
-    let deadline = Instant::now() + Duration::from_secs(180);
+    // 视频生成通常 1-5 分钟，给足 7 分钟（含排队）；任务 24h 内可查
+    let deadline = Instant::now() + Duration::from_secs(420);
     let mut consecutive_errors = 0u32;
 
     loop {
@@ -162,7 +166,7 @@ pub async fn run_bailian_video(
                 return Ok(RemoteVideo {
                     video_url: video_url.to_string(),
                     seconds,
-                    size: "720P".to_string(),
+                    size: "480P".to_string(),
                 });
             }
             "FAILED" => {
