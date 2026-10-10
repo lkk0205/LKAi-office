@@ -1,4 +1,5 @@
 pub mod agnes_media;
+pub mod bailian_video;
 pub mod chart_generate;
 pub mod doc_generate;
 pub mod drawio_generate;

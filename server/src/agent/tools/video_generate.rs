@@ -1,3 +1,4 @@
+use anyhow::Result;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -11,6 +12,7 @@ use crate::models::{ChatAttachment, ChatMessage};
 use super::agnes_media::{
     agnes_video_model, get_json, http_client, post_json, resolve_video_credentials,
 };
+use super::bailian_video;
 use super::local_video;
 
 pub struct VideoGenerateTool;
@@ -82,6 +84,16 @@ fn infer_num_frames(duration: &str) -> u32 {
     }
 }
 
+/// 视频时长（字符串秒数）：百炼 parse 为整数（2-30），Agnes 直接使用（4-12）
+fn infer_seconds(duration: &str) -> &'static str {
+    match duration.trim() {
+        "short" => "5",
+        "long" => "10",
+        "max" => "12",
+        _ => "5",
+    }
+}
+
 fn collect_video_images(ctx: &ToolContext, input: &serde_json::Value) -> Vec<String> {
     let mut images = input
         .get("image_urls")
@@ -126,12 +138,13 @@ fn attachment_to_data_url(attachment: &ChatAttachment) -> Option<String> {
         .map(ToString::to_string)
 }
 
+/// 生成模式：text / reference / keyframe
 fn normalize_mode(input: &str, image_count: usize) -> &'static str {
     match input.trim() {
-        "keyframes" => "keyframes",
-        "image_to_video" | "img2video" | "ti2vid" => "ti2vid",
-        _ if image_count > 0 => "ti2vid",
-        _ => "text_to_video",
+        "keyframes" | "keyframe" => "keyframe",
+        "reference" | "image_to_video" | "img2video" | "ti2vid" => "reference",
+        _ if image_count > 0 => "reference",
+        _ => "text",
     }
 }
 
@@ -145,6 +158,177 @@ fn default_video_plan(topic: &str, aspect_ratio: &str, duration: &str) -> VideoP
         negative_prompt: "low quality, blurry, distorted, flicker, watermark, text artifacts".into(),
         aspect_ratio: aspect_ratio.into(),
         duration: duration.into(),
+    }
+}
+
+/// 统一构造远程视频（百炼 / Agnes）成功结果
+#[allow(clippy::too_many_arguments)]
+fn remote_video_artifact(
+    topic: &str,
+    plan: &VideoPlan,
+    remote: &bailian_video::RemoteVideo,
+    provider: &str,
+    model: &str,
+    generation_mode: &str,
+    reference_image_count: usize,
+    frame_rate: u32,
+    num_frames: u32,
+) -> ToolResult {
+    let label = if provider == "bailian" {
+        "阿里云百炼·万相"
+    } else {
+        "Agnes"
+    };
+    ToolResult::ok(
+        format!("已为《{topic}》通过{label}生成视频结果"),
+        vec![ToolArtifact {
+            kind: "video".into(),
+            title: plan.title.clone(),
+            content: json!({
+                "type": "generated_video",
+                "title": plan.title,
+                "description": plan.description,
+                "prompt": plan.prompt,
+                "negative_prompt": plan.negative_prompt,
+                "video_url": remote.video_url,
+                "status": "completed",
+                "progress": 100,
+                "seconds": remote.seconds,
+                "size": remote.size,
+                "aspect_ratio": plan.aspect_ratio,
+                "duration": plan.duration,
+                "generation_mode": generation_mode,
+                "reference_image_count": reference_image_count,
+                "frame_rate": frame_rate,
+                "num_frames": num_frames,
+                "provider": provider,
+                "model": model,
+            }),
+        }],
+    )
+}
+
+/// 第二级远程尝试：Agnes Video 2.5（创建任务 + 轮询）
+async fn run_agnes_video(
+    ctx: &ToolContext,
+    plan: &VideoPlan,
+    images: &[String],
+    generation_mode: &str,
+) -> Result<bailian_video::RemoteVideo> {
+    let credentials = resolve_video_credentials(&ctx.user_id)?;
+    let video_model = agnes_video_model();
+    let client = http_client(Duration::from_secs(90))?;
+
+    // Agnes Video 2.5：不传 width/height/num_frames/frame_rate/negative_prompt，
+    // 分辨率由 size + aspect_ratio 决定，时长用 seconds，模式用 mode。
+    let api_mode = if generation_mode == "keyframe" && images.is_empty() {
+        "text"
+    } else {
+        generation_mode
+    };
+    let seconds = infer_seconds(&plan.duration);
+    let mut request_body = json!({
+        "model": video_model.as_str(),
+        "prompt": plan.prompt.clone(),
+        "mode": api_mode,
+        "seconds": seconds,
+        "size": "720P",
+        "aspect_ratio": plan.aspect_ratio.clone(),
+        "n": 1,
+    });
+
+    match api_mode {
+        "reference" => {
+            // 参考图模式：images 数组，Flash 最多 5 张
+            let imgs = images.iter().take(5).cloned().collect::<Vec<_>>();
+            request_body["images"] = json!(imgs);
+        }
+        "keyframe" => {
+            // 首尾帧模式：first_frame / last_frame
+            if let Some(first) = images.first() {
+                request_body["first_frame"] = json!(first);
+            }
+            if let Some(last) = images.get(1) {
+                request_body["last_frame"] = json!(last);
+            }
+        }
+        _ => {}
+    }
+
+    ctx.send(
+        "state_update",
+        json!({
+            "phase": "running",
+            "step": "提交 Agnes 任务",
+            "detail": format!("正在提交 Agnes 视频任务（{} / {}）...", plan.aspect_ratio, plan.duration),
+            "at": chrono::Utc::now().to_rfc3339(),
+        }),
+    );
+
+    let create_url = credentials.endpoint("/v1/videos");
+    let create_response =
+        post_json::<CreateVideoResponse>(&client, &create_url, &credentials, &request_body).await?;
+
+    let video_id = create_response.video_id.clone();
+    let task_id = create_response.task_id.clone();
+    let poll_url = format!(
+        "{}?video_id={}&model_name={}",
+        credentials.endpoint("/agnesapi"),
+        urlencoding::encode(&video_id),
+        urlencoding::encode(&video_model),
+    );
+    let deadline = Instant::now() + Duration::from_secs(480);
+    let mut latest_progress = create_response.progress.unwrap_or(0);
+
+    loop {
+        if Instant::now() >= deadline {
+            return Err(anyhow::anyhow!(
+                "Agnes 视频生成超时（task_id: {task_id}, video_id: {video_id}）"
+            ));
+        }
+
+        let status_response =
+            match get_json::<QueryVideoResponse>(&client, &poll_url, &credentials).await {
+                Ok(response) => response,
+                Err(err) => return Err(anyhow::anyhow!("获取 Agnes 视频结果失败：{err}")),
+            };
+
+        latest_progress = status_response.progress.unwrap_or(latest_progress);
+        ctx.send(
+            "state_update",
+            json!({
+                "phase": "running",
+                "step": "Agnes 视频生成中",
+                "detail": format!("Agnes 状态：{}（{}%）", status_response.status, latest_progress),
+                "at": chrono::Utc::now().to_rfc3339(),
+            }),
+        );
+
+        match status_response.status.as_str() {
+            "completed" => {
+                let video_url = status_response
+                    .url
+                    .clone()
+                    .or(status_response.remixed_from_video_id.clone())
+                    .filter(|url| !url.trim().is_empty())
+                    .ok_or_else(|| anyhow::anyhow!("Agnes 已完成但缺少视频链接"))?;
+                return Ok(bailian_video::RemoteVideo {
+                    video_url,
+                    seconds: status_response
+                        .seconds
+                        .unwrap_or_else(|| seconds.to_string()),
+                    size: status_response.size.unwrap_or_else(|| "720P".to_string()),
+                });
+            }
+            "failed" | "error" | "cancelled" => {
+                let detail = status_response
+                    .error
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "未知错误".to_string());
+                return Err(anyhow::anyhow!("Agnes 视频生成失败：{detail}"));
+            }
+            _ => sleep(Duration::from_secs(3)).await,
+        }
     }
 }
 
@@ -179,7 +363,7 @@ async fn local_video_artifact(
         num_frames,
         frame_rate,
     )
-        .await
+    .await
     {
         Ok(output) => ToolResult::ok(
             format!("已为《{topic}》生成本地兜底视频；远程服务失败原因：{fallback_reason}"),
@@ -223,7 +407,7 @@ impl OfficeTool for VideoGenerateTool {
     }
 
     fn description(&self) -> &str {
-        "生成视频结果：基于 Agnes Video V2.0 创建视频任务并返回可直接预览的 mp4 视频链接。"
+        "生成视频结果：优先使用阿里云百炼·万相，失败后兜底 Agnes，再失败本地合成，返回可直接预览的 mp4 视频。"
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -309,12 +493,12 @@ impl OfficeTool for VideoGenerateTool {
             }),
         );
 
-        let system_prompt = r#"你是资深导演兼 Agnes Video V2.0 提示词专家。只输出严格 JSON，不要 markdown。
+        let system_prompt = r#"你是资深导演兼视频生成模型提示词专家。只输出严格 JSON，不要 markdown。
 返回格式：
 {
   "title": "视频标题",
   "description": "视频创意说明",
-  "prompt": "可直接用于 Agnes Video V2.0 的英文提示词",
+  "prompt": "可直接用于视频生成模型的英文提示词",
   "negative_prompt": "需要避免的内容",
   "aspect_ratio": "16:9",
   "duration": "standard"
@@ -334,7 +518,7 @@ impl OfficeTool for VideoGenerateTool {
             "有参考图：必须以参考图为首要视觉约束，保持主体身份、脸部特征、发型、服装主体、构图和关键背景稳定，只设计自然小幅动作与镜头运动；不要换脸、不要新增人物、不要重构场景。"
         };
         let user_prompt = format!(
-            "需求：{topic}\n期望宽高比：{requested_aspect_ratio}\n期望时长档位：{duration}\n生成模式：{generation_mode}\n参考图片数量：{}\n参考图约束：{reference_guidance}\n请输出一套可直接用于 Agnes Video V2.0 的高质量视频生成方案。",
+            "需求：{topic}\n期望宽高比：{requested_aspect_ratio}\n期望时长档位：{duration}\n生成模式：{generation_mode}\n参考图片数量：{}\n参考图约束：{reference_guidance}\n请输出一套高质量视频生成方案。",
             image_inputs.len()
         );
 
@@ -385,244 +569,78 @@ impl OfficeTool for VideoGenerateTool {
         let num_frames = infer_num_frames(&plan.duration);
         let frame_rate = 24u32;
 
-        let credentials = match resolve_video_credentials(&ctx.user_id) {
-            Ok(credentials) => credentials,
-            Err(err) => {
-                return local_video_artifact(
-                    ctx,
-                    topic,
-                    &plan,
-                    width,
-                    height,
-                    frame_rate,
-                    num_frames,
-                    generation_mode,
-                    image_inputs.len(),
-                    format!("Agnes 凭证不可用：{err}"),
-                )
-                    .await;
-            }
-        };
-        let video_model = agnes_video_model();
-        let client = match http_client(Duration::from_secs(90)) {
-            Ok(client) => client,
-            Err(err) => {
-                return local_video_artifact(
-                    ctx,
-                    topic,
-                    &plan,
-                    width,
-                    height,
-                    frame_rate,
-                    num_frames,
-                    generation_mode,
-                    image_inputs.len(),
-                    format!("初始化 Agnes 客户端失败：{err}"),
-                )
-                    .await;
-            }
-        };
+        let duration_secs: u32 = infer_seconds(&plan.duration).parse().unwrap_or(5);
+        let first_frame = image_inputs.first().map(String::as_str);
 
-        ctx.send(
-            "state_update",
-            json!({
-                "phase": "running",
-                "step": "提交视频任务",
-                "detail": format!("正在提交 Agnes 视频生成任务（{} / {}）...", plan.aspect_ratio, plan.duration),
-                "at": chrono::Utc::now().to_rfc3339(),
-            }),
-        );
-
-        let mut request_body = json!({
-            "model": video_model.as_str(),
-            "prompt": plan.prompt.clone(),
-            "negative_prompt": plan.negative_prompt.clone(),
-            "width": width,
-            "height": height,
-            "num_frames": num_frames,
-            "frame_rate": frame_rate,
-        });
-
-        if generation_mode == "keyframes" && !image_inputs.is_empty() {
-            request_body["extra_body"] = json!({
-                "image": image_inputs.clone(),
-                "mode": "keyframes"
-            });
-        } else if image_inputs.len() > 1 {
-            request_body["extra_body"] = json!({
-                "image": image_inputs.clone()
-            });
-        } else if let Some(image) = image_inputs.first() {
-            request_body["image"] = json!(image);
-        }
-
-        let create_url = credentials.endpoint("/v1/videos");
-        let create_response = match post_json::<CreateVideoResponse>(
-            &client,
-            &create_url,
-            &credentials,
-            &request_body,
+        // 第一级：阿里云百炼·万相
+        match bailian_video::run_bailian_video(
+            ctx,
+            &plan.prompt,
+            &plan.aspect_ratio,
+            duration_secs,
+            first_frame,
         )
-            .await
+        .await
         {
-            Ok(response) => response,
-            Err(err) => {
-                return local_video_artifact(
-                    ctx,
+            Ok(remote) => {
+                let model = crate::config::config().bailian_video_model.clone();
+                return remote_video_artifact(
                     topic,
                     &plan,
-                    width,
-                    height,
-                    frame_rate,
-                    num_frames,
+                    &remote,
+                    "bailian",
+                    &model,
                     generation_mode,
                     image_inputs.len(),
-                    format!("Agnes 视频任务创建失败：{err}"),
-                )
-                    .await;
-            }
-        };
-
-        let video_id = create_response.video_id.clone();
-        let task_id = create_response.task_id.clone();
-        let poll_url = format!(
-            "{}?video_id={}&model_name={}",
-            credentials.endpoint("/agnesapi"),
-            urlencoding::encode(&video_id),
-            urlencoding::encode(&video_model),
-        );
-        let deadline = Instant::now() + Duration::from_secs(480);
-        let mut latest_progress = create_response.progress.unwrap_or(0);
-
-        loop {
-            if Instant::now() >= deadline {
-                return local_video_artifact(
-                    ctx,
-                    topic,
-                    &plan,
-                    width,
-                    height,
                     frame_rate,
                     num_frames,
-                    generation_mode,
-                    image_inputs.len(),
-                    "视频生成超时：任务已创建（task_id: {task_id}，video_id: {video_id}），请稍后重试"
-                )
-                    .await;
+                );
             }
+            Err(bailian_err) => {
+                tracing::warn!("百炼视频失败，降级 Agnes：{bailian_err}");
+                ctx.send(
+                    "state_update",
+                    json!({
+                        "phase": "running",
+                        "step": "降级 Agnes",
+                        "detail": format!("百炼视频不可用（{bailian_err}），正在改用 Agnes 视频服务..."),
+                        "at": chrono::Utc::now().to_rfc3339(),
+                    }),
+                );
 
-            let status_response = match get_json::<QueryVideoResponse>(
-                &client,
-                &poll_url,
-                &credentials,
-            )
-                .await
-            {
-                Ok(response) => response,
-                Err(err) => {
-                    return local_video_artifact(
-                        ctx,
-                        topic,
-                        &plan,
-                        width,
-                        height,
-                        frame_rate,
-                        num_frames,
-                        generation_mode,
-                        image_inputs.len(),
-                        format!("获取 Agnes 视频结果失败：{err}"),
-                    )
+                // 第二级：Agnes
+                match run_agnes_video(ctx, &plan, &image_inputs, generation_mode).await {
+                    Ok(remote) => {
+                        let model = agnes_video_model();
+                        return remote_video_artifact(
+                            topic,
+                            &plan,
+                            &remote,
+                            "agnes",
+                            &model,
+                            generation_mode,
+                            image_inputs.len(),
+                            frame_rate,
+                            num_frames,
+                        );
+                    }
+                    Err(agnes_err) => {
+                        // 第三级：本地 ffmpeg 兜底
+                        return local_video_artifact(
+                            ctx,
+                            topic,
+                            &plan,
+                            width,
+                            height,
+                            frame_rate,
+                            num_frames,
+                            generation_mode,
+                            image_inputs.len(),
+                            format!("百炼失败：{bailian_err}；Agnes失败：{agnes_err}"),
+                        )
                         .await;
+                    }
                 }
-            };
-
-            latest_progress = status_response.progress.unwrap_or(latest_progress);
-            ctx.send(
-                "state_update",
-                json!({
-                    "phase": "running",
-                    "step": "轮询视频结果",
-                    "detail": format!("视频状态：{}（{}%）", status_response.status, latest_progress),
-                    "at": chrono::Utc::now().to_rfc3339(),
-                }),
-            );
-
-            match status_response.status.as_str() {
-                "completed" => {
-                    let video_url = status_response
-                        .url
-                        .clone()
-                        .or_else(|| status_response.remixed_from_video_id.clone())
-                        .filter(|url| !url.trim().is_empty())
-                        .ok_or_else(|| "视频任务已完成，但没有拿到最终视频链接".to_string());
-                    let video_url = match video_url {
-                        Ok(url) => url,
-                        Err(err) => {
-                            return local_video_artifact(
-                                ctx,
-                                topic,
-                                &plan,
-                                width,
-                                height,
-                                frame_rate,
-                                num_frames,
-                                generation_mode,
-                                image_inputs.len(),
-                                err,
-                            )
-                                .await;
-                        }
-                    };
-                    return ToolResult::ok(
-                        format!("已为《{topic}》生成视频结果"),
-                        vec![ToolArtifact {
-                            kind: "video".into(),
-                            title: plan.title.clone(),
-                            content: json!({
-                                "type": "generated_video",
-                                "title": plan.title.clone(),
-                                "description": plan.description.clone(),
-                                "prompt": plan.prompt.clone(),
-                                "negative_prompt": plan.negative_prompt.clone(),
-                                "video_url": video_url,
-                                "task_id": task_id,
-                                "video_id": status_response.video_id.or(Some(video_id)),
-                                "status": status_response.status,
-                                "progress": status_response.progress.unwrap_or(100),
-                                "seconds": status_response.seconds,
-                                "size": status_response.size,
-                                "aspect_ratio": plan.aspect_ratio.clone(),
-                                "duration": plan.duration.clone(),
-                                "generation_mode": generation_mode,
-                                "reference_image_count": image_inputs.len(),
-                                "frame_rate": frame_rate,
-                                "num_frames": num_frames,
-                                "provider": "agnes",
-                                "model": status_response.model.unwrap_or_else(|| video_model.clone()),
-                            }),
-                        }],
-                    );
-                }
-                "failed" | "error" | "cancelled" => {
-                    let detail = status_response
-                        .error
-                        .map(|value| value.to_string())
-                        .unwrap_or_else(|| "未知错误".to_string());
-                    return local_video_artifact(
-                        ctx,
-                        topic,
-                        &plan,
-                        width,
-                        height,
-                        frame_rate,
-                        num_frames,
-                        generation_mode,
-                        image_inputs.len(),
-                        format!("Agnes 视频生成失败：{detail}"),
-                    )
-                        .await;
-                }
-                _ => sleep(Duration::from_secs(5)).await,
             }
         }
     }

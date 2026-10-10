@@ -30,6 +30,12 @@ pub struct Config {
     pub llm_video_api_keys: Vec<String>,
     pub llm_video_model: String,
     pub llm_video_models: Vec<String>,
+
+    // 百炼·万相视频配置（视频生成第一级；API Key 留空则自动跳过、降级 Agnes）
+    pub bailian_video_base_url: String,
+    pub bailian_video_api_key: String,
+    pub bailian_video_model: String,
+
     pub llm_provider: String,
     pub llm_tool_timeout_ms: u64,
     pub llm_chat_timeout_ms: u64,
@@ -110,6 +116,11 @@ impl Config {
             }
         };
 
+        // 百炼视频配置（可选项；API Key 留空时自动跳过百炼、降级 Agnes）
+        let bailian_video_base_url = env_or("BAILIAN_VIDEO_BASE_URL", "");
+        let bailian_video_api_key = env_or("BAILIAN_VIDEO_API_KEY", "");
+        let bailian_video_model = env_or("BAILIAN_VIDEO_MODEL", "wan3.0-video");
+
         let llm_model = llm_text_model.clone();
         let llm_api_key = llm_text_api_key.clone();
         let llm_api_keys = llm_text_api_keys.clone();
@@ -149,6 +160,9 @@ impl Config {
             llm_video_api_keys,
             llm_video_model,
             llm_video_models,
+            bailian_video_base_url,
+            bailian_video_api_key,
+            bailian_video_model,
             llm_provider: env_or("AIPPT_LLM_PROVIDER", "glm-gateway"),
             llm_tool_timeout_ms: env_or("AIPPT_LLM_TOOL_TIMEOUT_MS", "1800000")
                 .parse()
