@@ -258,8 +258,7 @@ pub async fn get_artifacts(pool: &DbPool, session_id: &str) -> AppResult<Vec<Art
 
     match row {
         Some(r) => {
-            let payload_bytes: Vec<u8> = r.try_get(0).map_err(|e| { tracing::error!("[Artifacts] col 0 (payload) error: {:?}", e); e })?;
-            let payload = String::from_utf8_lossy(&payload_bytes).to_string();
+            let payload: String = r.try_get(0).map_err(|e| { tracing::error!("[Artifacts] col 0 (payload) error: {:?}", e); e })?;
             Ok(serde_json::from_str::<Vec<Artifact>>(&payload)?)
         }
         None => Ok(vec![]),
@@ -336,12 +335,9 @@ pub async fn get_messages(pool: &DbPool, session_id: &str, limit: i64) -> AppRes
     let mut result = Vec::new();
     for row in rows {
         let role: String = row.try_get(0)?;
-        let content_bytes: Vec<u8> = row.try_get(1)?;
-        let content = String::from_utf8_lossy(&content_bytes).to_string();
-        let tool_input: Option<Vec<u8>> = row.try_get(2)?;
-        let tool_input = tool_input.map(|b| String::from_utf8_lossy(&b).to_string());
-        let tool_output: Option<Vec<u8>> = row.try_get(3)?;
-        let tool_output = tool_output.map(|b| String::from_utf8_lossy(&b).to_string());
+        let content: String = row.try_get(1)?;
+        let tool_input: Option<String> = row.try_get(2)?;
+        let tool_output: Option<String> = row.try_get(3)?;
         let tool_calls = tool_input.as_ref().and_then(|s| serde_json::from_str(s).ok());
         let tool_call_id = tool_output;
         result.push(ChatMessage {
@@ -371,12 +367,9 @@ pub async fn get_persisted_messages(
     let mut result = Vec::new();
     for (i, row) in rows.iter().enumerate() {
         let role: String = row.try_get(0).map_err(|e| { tracing::error!("[Messages] row {} col 0 (role) error: {:?}", i, e); e })?;
-        let content_bytes: Vec<u8> = row.try_get(1).map_err(|e| { tracing::error!("[Messages] row {} col 1 (content) error: {:?}", i, e); e })?;
-        let content = String::from_utf8_lossy(&content_bytes).to_string();
-        let tool_input: Option<Vec<u8>> = row.try_get(2).map_err(|e| { tracing::error!("[Messages] row {} col 2 (tool_input) error: {:?}", i, e); e })?;
-        let tool_input = tool_input.map(|b| String::from_utf8_lossy(&b).to_string());
-        let tool_output: Option<Vec<u8>> = row.try_get(3).map_err(|e| { tracing::error!("[Messages] row {} col 3 (tool_output) error: {:?}", i, e); e })?;
-        let tool_output = tool_output.map(|b| String::from_utf8_lossy(&b).to_string());
+        let content: String = row.try_get(1).map_err(|e| { tracing::error!("[Messages] row {} col 1 (content) error: {:?}", i, e); e })?;
+        let tool_input: Option<String> = row.try_get(2).map_err(|e| { tracing::error!("[Messages] row {} col 2 (tool_input) error: {:?}", i, e); e })?;
+        let tool_output: Option<String> = row.try_get(3).map_err(|e| { tracing::error!("[Messages] row {} col 3 (tool_output) error: {:?}", i, e); e })?;
         let created_at: String = row.try_get(4).map_err(|e| { tracing::error!("[Messages] row {} col 4 (created_at) error: {:?}", i, e); e })?;
         let tool_calls = tool_input.as_ref().and_then(|s| serde_json::from_str(s).ok());
         result.push(PersistedChatMessage {
